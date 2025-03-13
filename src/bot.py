@@ -4,6 +4,8 @@ from discord import app_commands
 from discord.ext import commands
 import asyncpg
 from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
+import asyncio
 
 load_dotenv()
 
@@ -15,23 +17,32 @@ class AdminConfig(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    async def index_channel(self, channel: discord.TextChannel):
-        """Index all messages (i.e. load and store) from the given channel."""
-        print(f"Starting indexing for channel '{channel.name}' in guild '{channel.guild.name}'")
-        async with self.bot.pg_pool.acquire() as conn:
-            async for msg in channel.history(limit=None, oldest_first=True):
-                created_at = msg.created_at.replace(tzinfo=None)
-                try:
-                    await conn.execute("""
-                        INSERT INTO public.discord_messages 
-                            (id, guild_id, channel_id, author_id, author_name, content, created_at, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
-                        ON CONFLICT (id) DO NOTHING;
-                    """, msg.id, msg.guild.id, msg.channel.id,
-                         msg.author.id, msg.author.name, msg.content, created_at)
-                except Exception as e:
-                    print(f"Error indexing message {msg.id}: {e}")
-        print(f"Finished indexing for channel '{channel.name}'")
+    async def index_channel(self, channel: discord.TextChannel, after_time: datetime = None):
+        """
+        Index all messages from the given channel starting after 'after_time' (if provided)
+        and up until the current time.
+        """
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        print(f"[Indexing] Starting indexing for channel '{channel.name}' in guild '{channel.guild.name}' (after: {after_time}, before: {now})")
+        count = 0
+        try:
+            async with self.bot.pg_pool.acquire() as conn:
+                async for msg in channel.history(limit=None, oldest_first=True, after=after_time, before=now):
+                    created_at = msg.created_at.replace(tzinfo=None)
+                    try:
+                        await conn.execute("""
+                            INSERT INTO public.discord_messages 
+                                (id, guild_id, channel_id, author_id, author_name, content, created_at, updated_at)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+                            ON CONFLICT (id) DO NOTHING;
+                        """, msg.id, msg.guild.id, msg.channel.id,
+                             msg.author.id, msg.author.name, msg.content, created_at)
+                        count += 1
+                    except Exception as e:
+                        print(f"[Indexing] Error indexing message {msg.id}: {e}")
+        except Exception as e:
+            print(f"[Indexing] Error fetching history for channel '{channel.name}': {e}")
+        print(f"[Indexing] Finished indexing for channel '{channel.name}'. Indexed {count} messages.")
 
     @app_commands.command(name="add_channel", description="Add a channel for the bot to track and index its messages")
     @app_commands.describe(channel="Select the channel to add")
@@ -59,8 +70,7 @@ class AdminConfig(commands.Cog):
             f"Channel {channel.mention} has been added for tracking. Initiating indexing of message history.",
             ephemeral=True
         )
-        # Start indexing in background
-        self.bot.loop.create_task(self.index_channel(channel))
+        self.bot.loop.create_task(self.index_channel(channel, after_time=None))
 
     @app_commands.command(name="remove_channel", description="Remove a channel from tracking")
     @app_commands.describe(channel="Select the channel to remove")
@@ -141,9 +151,9 @@ class MessageIngestion(commands.Cog):
                     ON CONFLICT (id) DO NOTHING;
                 """, message.id, message.guild.id, message.channel.id,
                      message.author.id, message.author.name, message.content, created_at)
-            print(f"Indexed new message {message.id} in channel {message.channel.name}")
+            print(f"[Ingestion] Indexed new message {message.id} in channel {message.channel.name}")
         except Exception as e:
-            print(f"Error indexing message {message.id}: {e}")
+            print(f"[Ingestion] Error indexing message {message.id}: {e}")
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
@@ -165,9 +175,9 @@ class MessageIngestion(commands.Cog):
                     SET content = $1, updated_at = NOW()
                     WHERE id = $2;
                 """, after.content, after.id)
-            print(f"Updated indexed message {after.id} in channel {after.channel.name}")
+            print(f"[Ingestion] Updated indexed message {after.id} in channel {after.channel.name}")
         except Exception as e:
-            print(f"Error updating message {after.id}: {e}")
+            print(f"[Ingestion] Error updating message {after.id}: {e}")
 
 class MessageSearch(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -218,6 +228,38 @@ class MyBot(commands.Bot):
         await self.add_cog(MessageIngestion(self))
         await self.add_cog(MessageSearch(self))
         await self.tree.sync()
+
+    async def reindex_all_channels(self):
+        """
+        Loop through all tracked channels for all servers and run full re-indexing.
+        """
+        print("[Reindex] Starting re-indexing of all tracked channels...")
+        async with self.pg_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT guild_id, channel_id FROM public.tracked_channels")
+        print(f"[Reindex] Found {len(rows)} tracked channels.")
+        admin_cog = self.get_cog("AdminConfig")
+        tasks = []
+        for row in rows:
+            guild = self.get_guild(row["guild_id"])
+            if guild is None:
+                print(f"[Reindex] Guild {row['guild_id']} not found in cache.")
+                continue
+            channel = guild.get_channel(row["channel_id"])
+            if channel is None:
+                print(f"[Reindex] Channel {row['channel_id']} not found in guild {guild.name}.")
+                continue
+            print(f"[Reindex] Scheduling full re-indexing for channel {channel.name} in guild {guild.name}.")
+            tasks.append(self.loop.create_task(admin_cog.index_channel(channel, after_time=None)))
+        if tasks:
+            await asyncio.gather(*tasks)
+        print("[Reindex] All caught up.")
+
+    async def on_ready(self):
+        print(f"Bot logged in as {self.user} and ready.")
+        # Wait a few seconds to ensure cache is fully populated.
+        # await discord.utils.sleep_until(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=5))
+        # Re-run full indexing for all tracked channels.
+        await self.reindex_all_channels()
 
 bot = MyBot()
 bot.run(os.environ.get('YOUR_DISCORD_BOT_TOKEN'))
