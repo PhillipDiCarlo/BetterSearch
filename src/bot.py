@@ -83,14 +83,22 @@ class AdminConfig(commands.Cog):
         channel_id = channel.id
 
         async with self.bot.pg_pool.acquire() as conn:
+            # Remove the channel from tracked_channels.
             await conn.execute("""
                 DELETE FROM public.tracked_channels
                 WHERE guild_id = $1 AND channel_id = $2;
             """, guild_id, channel_id)
+            # Also delete messages indexed for that channel.
+            await conn.execute("""
+                DELETE FROM public.discord_messages
+                WHERE guild_id = $1 AND channel_id = $2;
+            """, guild_id, channel_id)
+
         await interaction.response.send_message(
-            f"Channel {channel.mention} has been removed from tracking.",
+            f"Channel {channel.mention} has been removed from tracking and its messages have been deleted from the index.",
             ephemeral=True
         )
+
 
     @app_commands.command(name="config", description="Show the tracked channels in this server")
     async def config(self, interaction: discord.Interaction):
@@ -185,16 +193,16 @@ class MessageSearch(commands.Cog):
 
     @app_commands.command(name="search", description="Search stored messages by keyword")
     @app_commands.describe(query="The search query")
-    async def search(self, interaction: discord.Interaction, query: str):
+    async def search(self, interaction, query: str):
         guild_id = interaction.guild.id
         async with self.bot.pg_pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT id, channel_id, content, author_name, created_at 
                 FROM public.discord_messages
-                WHERE content_tsv @@ plainto_tsquery('english', $1)
+                WHERE guild_id = $1 AND content_tsv @@ plainto_tsquery('english', $2)
                 ORDER BY created_at DESC
                 LIMIT 5;
-            """, query)
+            """, guild_id, query)
         if rows:
             embed = discord.Embed(
                 title="Search Results",
